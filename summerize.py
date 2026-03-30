@@ -3,9 +3,42 @@ from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor
 import tiktoken
 import os
+import signal
 
 # Add your own OpenAI API key
 openai_api_key = os.getenv("OPENAI_API_KEY")
+
+
+def _client():
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    return OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("OPENAI_API_BASE_URL", "https://openrouter.ai/api/v1"),
+        timeout=20,
+        max_retries=0,
+    )
+
+
+def _chat_model_name():
+    return os.getenv("OPENAI_MODEL", "meta-llama/llama-3-8b-instruct")
+
+
+class _HardTimeoutError(TimeoutError):
+    pass
+
+
+def _run_with_hard_timeout(seconds, func, *args, **kwargs):
+    def _handler(signum, frame):
+        raise _HardTimeoutError(f"LLM request exceeded {seconds}s hard timeout")
+
+    prev_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev_handler)
 
 sum_prompt = """
 Generate a structured summary from the provided medical source (report, paper, or book), strictly adhering to the following categories. The summary should list key information under each category in a concise format: 'CATEGORY_NAME: Key information'. No additional explanations or detailed descriptions are necessary unless directly related to the categories:
@@ -33,12 +66,11 @@ Each category should be addressed only if relevant to the content of the medical
 """
 
 def call_openai_api(chunk):
-    client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE_URL")
-    )
-    response = client.chat.completions.create(
-        model="gpt-4-1106-preview",
+    client = _client()
+    response = _run_with_hard_timeout(
+        45,
+        client.chat.completions.create,
+        model=_chat_model_name(),
         messages=[
             {"role": "system", "content": sum_prompt},
             {"role": "user", "content": f" {chunk}"},
@@ -47,11 +79,16 @@ def call_openai_api(chunk):
         n=1,
         stop=None,
         temperature=0.5,
+        timeout=20,
     )
     return response.choices[0].message.content
 
 def split_into_chunks(text, tokens=500):
-    encoding = tiktoken.encoding_for_model('gpt-4-1106-preview')
+    model_name = _chat_model_name()
+    try:
+        encoding = tiktoken.encoding_for_model(model_name)
+    except Exception:
+        encoding = tiktoken.get_encoding("cl100k_base")
     words = encoding.encode(text)
     chunks = []
     for i in range(0, len(words), tokens):

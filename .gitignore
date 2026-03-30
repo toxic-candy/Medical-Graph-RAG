@@ -1,5 +1,5 @@
 *.txt
-dataset
+# dataset
 dataset_paper
 dataset_test
 test*
@@ -15,3 +15,5 @@ __pycache__
 
 # ignore special files or folds
 .DS_Store
+
+.venv

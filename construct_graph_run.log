@@ -1,0 +1,30 @@
+/home/bruh/Documents/Medical-Graph-RAG/.venv/lib/python3.14/site-packages/requests/__init__.py:113: RequestsDependencyWarning: urllib3 (2.6.3) or chardet (7.3.0)/charset_normalizer (3.4.6) doesn't match a supported version!
+  warnings.warn(
+Neo4jGraph init failed (Could not use APOC procedures. Please ensure the APOC plugin is installed in Neo4j and that 'apoc.meta.data()' is allowed in Neo4j configuration ). Falling back to SimpleNeo4jGraph without APOC.
+Starting graph construction for 10 files from ./dataset/mimic_demo_10
+[1/10] Processing report_00_subject_10000032.txt
+[1/10] Done report_00_subject_10000032.txt gid=7a71bf09-0f9c-45fe-8436-8c7f1325fa26
+[2/10] Processing report_01_subject_10001217.txt
+[2/10] Done report_01_subject_10001217.txt gid=3fcf001f-b9ea-4067-b3e1-7d223cda7bdb
+[3/10] Processing report_02_subject_10001725.txt
+[3/10] Done report_02_subject_10001725.txt gid=a890e27e-c534-41e4-8fbd-05dbff337ed5
+[4/10] Processing report_03_subject_10002428.txt
+[4/10] Done report_03_subject_10002428.txt gid=96857466-d331-4ff7-b430-3c80b36af14c
+[5/10] Processing report_04_subject_10002495.txt
+[5/10] Done report_04_subject_10002495.txt gid=7692e86c-daa7-4b0d-969e-dd6b3ed9c0fa
+[6/10] Processing report_05_subject_10002930.txt
+[6/10] Done report_05_subject_10002930.txt gid=558c8f02-219a-4153-ac9f-e16ba2da491b
+[7/10] Processing report_06_subject_10003046.txt
+[7/10] Done report_06_subject_10003046.txt gid=dbcb10c4-403c-43d3-bc16-7d44c71d86c5
+[8/10] Processing report_07_subject_10003400.txt
+[8/10] Done report_07_subject_10003400.txt gid=28b5b78d-6224-46e3-8c65-0eb341f12620
+[9/10] Processing report_08_subject_10004235.txt
+[9/10] Done report_08_subject_10004235.txt gid=e9fd0b5e-1648-45d3-9a45-2f39b602c6a9
+[10/10] Processing report_09_subject_10004422.txt
+[10/10] Done report_09_subject_10004422.txt gid=f82c2e67-8bff-4242-afe3-a5b25154b12e
+Graph construction finished. Succeeded: 10 / 10. Failed: 0
+Exception ignored while calling deallocator <function Bolt.__del__ at 0x7f3751d10b40>:
+Traceback (most recent call last):
+  File "/home/bruh/Documents/Medical-Graph-RAG/.venv/lib/python3.14/site-packages/neo4j/_sync/io/_bolt.py", line 183, in __del__
+  File "/usr/lib/python3.14/asyncio/coroutines.py", line 21, in iscoroutinefunction
+ImportError: sys.meta_path is None, Python is likely shutting down

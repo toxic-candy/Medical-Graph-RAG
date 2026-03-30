@@ -9,8 +9,9 @@ import argparse
 from pathlib import Path
 
 from camel.storages import Neo4jGraph
+from simple_neo4j_graph import SimpleNeo4jGraph
 from dataloader import load_high
-from creat_graph_with_description import creat_metagraph_with_description
+from creat_graph import creat_metagraph
 from utils import str_uuid, ref_link
 
 
@@ -25,12 +26,21 @@ class ThreeLayerImporter:
         
         # 连接 Neo4j
         print("\n[连接Neo4j]...")
-        self.n4j = Neo4jGraph(
-            url=neo4j_url,
-            username=neo4j_username,
-            password=neo4j_password
-        )
-        print("✅ Neo4j连接成功")
+        try:
+            self.n4j = Neo4jGraph(
+                url=neo4j_url,
+                username=neo4j_username,
+                password=neo4j_password
+            )
+            print("✅ Neo4j连接成功")
+        except Exception as e:
+            print(f"Neo4jGraph init failed ({e}). Falling back to SimpleNeo4jGraph without APOC.")
+            self.n4j = SimpleNeo4jGraph(
+                url=neo4j_url,
+                username=neo4j_username,
+                password=neo4j_password
+            )
+            print("✅ SimpleNeo4jGraph连接成功")
         
         # 存储每层的 GID
         self.layer_gids = {
@@ -97,10 +107,8 @@ class ThreeLayerImporter:
                 gid = str_uuid()
                 self.layer_gids[layer_name].append(gid)
                 
-                # 创建图谱（使用融合版函数）
-                self.n4j = creat_metagraph_with_description(
-                    args, content, gid, self.n4j
-                )
+                # 创建图谱（使用稳定构图函数）
+                self.n4j = creat_metagraph(args, content, gid, self.n4j)
                 
                 print(f"✅ 完成: {file_path.name} (GID: {gid[:8]}...)")
                 

@@ -1,5 +1,7 @@
 from openai import OpenAI
 import os
+import hashlib
+import signal
 from neo4j import GraphDatabase
 import numpy as np
 from camel.storages import Neo4jGraph
@@ -18,18 +20,63 @@ Modify the response to the question using the provided references. Include preci
 # Add your own OpenAI API key
 openai_api_key = os.getenv("OPENAI_API_KEY")
 
+
+def _client():
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    return OpenAI(
+        api_key=api_key,
+        base_url=os.getenv("OPENAI_API_BASE_URL", "https://openrouter.ai/api/v1"),
+        timeout=20,
+        max_retries=0,
+    )
+
+
+def _chat_model_name():
+    return os.getenv("OPENAI_MODEL", "meta-llama/llama-3-8b-instruct")
+
+
+def _embedding_model_name():
+    return os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
+
+class _HardTimeoutError(TimeoutError):
+    pass
+
+
+def _run_with_hard_timeout(seconds, func, *args, **kwargs):
+    def _handler(signum, frame):
+        raise _HardTimeoutError(f"LLM request exceeded {seconds}s hard timeout")
+
+    prev_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        return func(*args, **kwargs)
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, prev_handler)
+
+
+def _hash_embedding(text: str, dim: int = 256):
+    # Deterministic fallback embedding for environments without embedding APIs.
+    seed = int(hashlib.sha256(text.encode("utf-8")).hexdigest()[:16], 16)
+    rng = np.random.default_rng(seed)
+    v = rng.standard_normal(dim)
+    norm = np.linalg.norm(v)
+    if norm == 0:
+        return v.tolist()
+    return (v / norm).tolist()
+
 def get_embedding(text, mod = "text-embedding-3-small"):
-    client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE_URL")
-    )
-
-    response = client.embeddings.create(
-        input=text,
-        model=mod
-    )
-
-    return response.data[0].embedding
+    if os.getenv("USE_REMOTE_EMBEDDINGS", "0") != "1":
+        return _hash_embedding(text)
+    try:
+        client = _client()
+        model_name = os.getenv("OPENAI_EMBEDDING_MODEL", mod or _embedding_model_name())
+        response = client.embeddings.create(input=text, model=model_name, timeout=20)
+        return response.data[0].embedding
+    except Exception:
+        return _hash_embedding(text)
 
 def fetch_texts(n4j):
     # Fetch the text for each node
@@ -65,7 +112,11 @@ def add_gid(graph_element, gid):
     return graph_element
 
 def add_sum(n4j,content,gid):
-    sum = process_chunks(content)
+    if os.getenv("USE_LLM_SUMMARY", "0") == "1":
+        sum = process_chunks(content)
+    else:
+        # Lightweight local summary fallback to keep ingestion deterministic.
+        sum = [content[:1500]]
     creat_sum_query = """
         CREATE (s:Summary {content: $sum, gid: $gid})
         RETURN s
@@ -83,12 +134,11 @@ def add_sum(n4j,content,gid):
     return s
 
 def call_llm(sys, user):
-    client = OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OPENAI_API_BASE_URL")
-    )
-    response = client.chat.completions.create(
-        model="gpt-4-1106-preview",
+    client = _client()
+    response = _run_with_hard_timeout(
+        45,
+        client.chat.completions.create,
+        model=_chat_model_name(),
         messages=[
             {"role": "system", "content": sys},
             {"role": "user", "content": f" {user}"},
@@ -97,6 +147,7 @@ def call_llm(sys, user):
         n=1,
         stop=None,
         temperature=0.5,
+        timeout=20,
     )
     return response.choices[0].message.content
 
@@ -159,7 +210,7 @@ def ret_context(n4j, gid):
     UNWIND nodes AS n
     UNWIND nodes AS m
     MATCH (n)-[r]-(m)
-    WHERE n.gid = m.gid AND id(n) < id(m) AND NOT n:Summary AND NOT m:Summary // Ensure each pair is processed once and exclude "Summary" nodes in relationships
+    WHERE n.gid = m.gid AND elementId(n) < elementId(m) AND NOT n:Summary AND NOT m:Summary // Ensure each pair is processed once and exclude "Summary" nodes in relationships
     WITH n, m, TYPE(r) AS relType
 
     // Return node IDs and relationship types in structured format
@@ -176,7 +227,9 @@ def merge_similar_nodes(n4j, gid):
         merge_query = """
             WITH 0.5 AS threshold
             MATCH (n), (m)
-            WHERE NOT n:Summary AND NOT m:Summary AND n.gid = m.gid AND n.gid = $gid AND n<>m AND apoc.coll.sort(labels(n)) = apoc.coll.sort(labels(m))
+                        WHERE NOT n:Summary AND NOT m:Summary AND n.gid = m.gid AND n.gid = $gid AND n<>m
+                            AND size([l IN labels(n) WHERE l IN labels(m)]) = size(labels(n))
+                            AND size(labels(n)) = size(labels(m))
             WITH n, m,
                 gds.similarity.cosine(n.embedding, m.embedding) AS similarity
             WHERE similarity > threshold
@@ -191,7 +244,9 @@ def merge_similar_nodes(n4j, gid):
             // Define a threshold for cosine similarity
             WITH 0.5 AS threshold
             MATCH (n), (m)
-            WHERE NOT n:Summary AND NOT m:Summary AND n<>m AND apoc.coll.sort(labels(n)) = apoc.coll.sort(labels(m))
+                        WHERE NOT n:Summary AND NOT m:Summary AND n<>m
+                            AND size([l IN labels(n) WHERE l IN labels(m)]) = size(labels(n))
+                            AND size(labels(n)) = size(labels(m))
             WITH n, m,
                 gds.similarity.cosine(n.embedding, m.embedding) AS similarity
             WHERE similarity > threshold
@@ -223,9 +278,17 @@ def ref_link(n4j, gid1, gid2):
         WITH n, m, 0.6 AS threshold
 
         // Compute cosine similarity and apply the threshold
-        WHERE apoc.coll.sort(labels(n)) = apoc.coll.sort(labels(m)) AND n <> m
+                WHERE n <> m
+                    AND size([l IN labels(n) WHERE l IN labels(m)]) = size(labels(n))
+                    AND size(labels(n)) = size(labels(m))
+        WITH n, m, threshold, n.embedding AS e1, m.embedding AS e2
+        WHERE e1 IS NOT NULL AND e2 IS NOT NULL AND size(e1) = size(e2) AND size(e1) > 0
+        WITH n, m, threshold, e1, e2,
+            reduce(dot = 0.0, i IN range(0, size(e1) - 1) | dot + (e1[i] * e2[i])) AS dot,
+            sqrt(reduce(n1 = 0.0, x IN e1 | n1 + (x * x))) AS norm1,
+            sqrt(reduce(n2 = 0.0, x IN e2 | n2 + (x * x))) AS norm2
         WITH n, m, threshold,
-            gds.similarity.cosine(n.embedding, m.embedding) AS similarity
+            CASE WHEN norm1 = 0 OR norm2 = 0 THEN 0.0 ELSE dot / (norm1 * norm2) END AS similarity
         WHERE similarity > threshold
 
         // Create a relationship based on the condition
