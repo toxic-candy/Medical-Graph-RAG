@@ -2,6 +2,7 @@ from openai import OpenAI
 import os
 import hashlib
 import signal
+import threading
 from neo4j import GraphDatabase
 import numpy as np
 from camel.storages import Neo4jGraph
@@ -44,6 +45,11 @@ class _HardTimeoutError(TimeoutError):
 
 
 def _run_with_hard_timeout(seconds, func, *args, **kwargs):
+    # signal.alarm only works in the main thread; fall back to a plain call
+    # when running inside a worker thread (e.g. during batch import).
+    if threading.current_thread() is not threading.main_thread():
+        return func(*args, **kwargs)
+
     def _handler(signum, frame):
         raise _HardTimeoutError(f"LLM request exceeded {seconds}s hard timeout")
 
@@ -99,9 +105,26 @@ def add_nodes_emb(n4j):
             add_embeddings(n4j, node['id'], embedding)
 
 def add_ge_emb(graph_element):
-    for node in graph_element.nodes:
-        emb = get_embedding(node.id)
-        node.properties['embedding'] = emb
+    nodes = graph_element.nodes
+    if not nodes:
+        return graph_element
+
+    # Batch all node texts into a single API call when using remote embeddings.
+    if os.getenv("USE_REMOTE_EMBEDDINGS", "0") == "1":
+        texts = [n.id for n in nodes]
+        try:
+            client = _client()
+            model_name = _embedding_model_name()
+            response = client.embeddings.create(input=texts, model=model_name, timeout=60)
+            embeddings = [item.embedding for item in response.data]
+            for node, emb in zip(nodes, embeddings):
+                node.properties['embedding'] = emb
+            return graph_element
+        except Exception:
+            pass  # fall through to per-node hash fallback
+
+    for node in nodes:
+        node.properties['embedding'] = _hash_embedding(node.id)
     return graph_element
 
 def add_gid(graph_element, gid):
@@ -122,14 +145,12 @@ def add_sum(n4j,content,gid):
         RETURN s
         """
     s = n4j.query(creat_sum_query, {'sum': sum, 'gid': gid})
-    
-    link_sum_query = """
-        MATCH (s:Summary {gid: $gid}), (n)
-        WHERE n.gid = s.gid AND NOT n:Summary
-        CREATE (s)-[:SUMMARIZES]->(n)
-        RETURN s, n
-        """
-    n4j.query(link_sum_query, {'gid': gid})
+
+    # NOTE: We intentionally do NOT create SUMMARIZES edges from the Summary
+    # node to every entity node.  Those edges were never used by any retrieval
+    # query (ret_context, link_context, ref_link all filter out Summary nodes
+    # and find entities via the shared gid property).  The star of SUMMARIZES
+    # edges was the primary cause of the hub-spoke topology in visualisations.
 
     return s
 

@@ -54,6 +54,7 @@ docker run -d \
   --name medgraphrag-neo4j \
   -p 7474:7474 -p 7687:7687 \
   -e NEO4J_AUTH=neo4j/test1234 \
+  -e NEO4J_PLUGINS='["apoc"]' \
   neo4j:5
 ```
 
@@ -104,9 +105,9 @@ Expected directories:
 Run in deterministic local mode (no remote LLM extraction/summarization/embeddings):
 
 ```bash
-USE_LLM_EXTRACTION=0 \
-USE_LLM_SUMMARY=0 \
-USE_REMOTE_EMBEDDINGS=0 \
+USE_LLM_EXTRACTION=1 \
+USE_LLM_SUMMARY=1 \
+USE_REMOTE_EMBEDDINGS=1 \
 python three_layer_import.py \
   --neo4j-password test1234 \
   --clear \

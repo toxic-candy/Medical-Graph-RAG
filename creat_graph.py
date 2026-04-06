@@ -1,6 +1,5 @@
 import os
 import re
-import signal
 
 from openai import OpenAI
 from camel.loaders import UnstructuredIO
@@ -10,29 +9,28 @@ from utils import *
 
 
 KG_SYSTEM_PROMPT = (
-    "You extract medical entities and relationships from text. "
-    "Return ONLY lines in this exact format: "
-    "Node(id='ENTITY', type='TYPE') and "
-    "Relationship(subj=Node(id='S', type='ST'), obj=Node(id='O', type='OT'), type='REL')."
+    "You are a medical knowledge graph extraction engine. "
+    "Given clinical text, extract TYPED medical entities and the relationships BETWEEN them. "
+    "Do NOT create a central Patient hub node that connects to everything. "
+    "Instead, create direct relationships between medical concepts.\n\n"
+    "Entity types to use: Disease, Symptom, Medication, Medical_Test, Procedure, "
+    "Condition, Anatomy, Measurement, Diagnosis, LabTest, Hormone, Clinical_Finding\n\n"
+    "Relationship types to use: treats, caused_by, detects, associated_with, "
+    "prescribed_for, performed_for, indicates, monitors, contraindicates, "
+    "complication_of, symptom_of, diagnosed_by, administered_via, "
+    "measured_by, affects, produces, risk_factor_for\n\n"
+    "Return ONLY lines in these exact formats:\n"
+    "Node(id='ENTITY_NAME', type='TYPE', description='BRIEF_DESCRIPTION')\n"
+    "Relationship(subj=Node(id='S', type='ST'), obj=Node(id='O', type='OT'), type='REL_TYPE')\n\n"
+    "Example output:\n"
+    "Node(id='Vascular Dementia', type='Disease', description='A form of dementia caused by impaired blood flow to the brain')\n"
+    "Node(id='MRI', type='Medical_Test', description='Imaging technique showing structural brain changes')\n"
+    "Node(id='Chronic Ischemic Damage', type='Condition', description='Brain damage due to reduced blood supply')\n"
+    "Relationship(subj=Node(id='Vascular Dementia', type='Disease'), obj=Node(id='Chronic Ischemic Damage', type='Condition'), type='caused_by')\n"
+    "Relationship(subj=Node(id='MRI', type='Medical_Test'), obj=Node(id='Chronic Ischemic Damage', type='Condition'), type='detects')\n"
 )
 
 
-class _HardTimeoutError(TimeoutError):
-    pass
-
-
-def _run_with_hard_timeout(seconds, func, *args, **kwargs):
-    def _handler(signum, frame):
-        raise _HardTimeoutError(f"LLM request exceeded {seconds}s hard timeout")
-
-    prev_handler = signal.getsignal(signal.SIGALRM)
-    signal.signal(signal.SIGALRM, _handler)
-    signal.alarm(seconds)
-    try:
-        return func(*args, **kwargs)
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, prev_handler)
 
 
 def _extract_graph_elements_from_text(raw_text, source_element):
@@ -49,15 +47,14 @@ def _extract_graph_elements_from_text(raw_text, source_element):
     model = os.getenv("OPENAI_MODEL", "meta-llama/llama-3-8b-instruct")
 
     user_prompt = (
-        "Extract nodes and directed relationships from this medical content. "
-        "Use concise entity IDs and meaningful types.\n\n"
+        "Extract typed medical entities and the direct relationships between them. "
+        "Do NOT make a Patient node the center of every relationship. "
+        "Focus on medical concept interconnections.\n\n"
         f"CONTENT:\n{raw_text}"
     )
 
     try:
-        response = _run_with_hard_timeout(
-            45,
-            client.chat.completions.create,
+        response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": KG_SYSTEM_PROMPT},
@@ -65,13 +62,14 @@ def _extract_graph_elements_from_text(raw_text, source_element):
             ],
             max_tokens=1200,
             temperature=0.0,
-            timeout=20,
+            timeout=45,
         )
         content = response.choices[0].message.content or ""
     except Exception:
         return _fallback_extract_graph_elements(raw_text, source_element)
 
-    node_pattern = r"Node\(id='(.*?)', type='(.*?)'\)"
+    # Parse nodes — with optional description field
+    node_pattern = r"Node\(id='(.*?)', type='(.*?)'(?:, description='(.*?)')?\)"
     rel_pattern = (
         r"Relationship\(subj=Node\(id='(.*?)', type='(.*?)'\), "
         r"obj=Node\(id='(.*?)', type='(.*?)'\), type='(.*?)'\)"
@@ -81,15 +79,14 @@ def _extract_graph_elements_from_text(raw_text, source_element):
     relationships = []
 
     for match in re.finditer(node_pattern, content):
-        node_id, node_type = match.groups()
-        node_id = node_id.strip()
-        node_type = node_type.strip() or "Entity"
+        node_id, node_type = match.group(1).strip(), match.group(2).strip()
+        node_desc = (match.group(3) or "").strip()
+        node_type = node_type or "Entity"
         if node_id and node_id not in nodes:
-            nodes[node_id] = Node(
-                id=node_id,
-                type=node_type,
-                properties={"source": "openrouter_llama_extracted"},
-            )
+            props = {"source": "llm_extracted"}
+            if node_desc:
+                props["description"] = node_desc
+            nodes[node_id] = Node(id=node_id, type=node_type, properties=props)
 
     for match in re.finditer(rel_pattern, content):
         subj_id, subj_type, obj_id, obj_type, rel_type = match.groups()
@@ -106,13 +103,13 @@ def _extract_graph_elements_from_text(raw_text, source_element):
             nodes[subj_id] = Node(
                 id=subj_id,
                 type=subj_type,
-                properties={"source": "openrouter_llama_extracted"},
+                properties={"source": "llm_extracted"},
             )
         if obj_id not in nodes:
             nodes[obj_id] = Node(
                 id=obj_id,
                 type=obj_type,
-                properties={"source": "openrouter_llama_extracted"},
+                properties={"source": "llm_extracted"},
             )
 
         relationships.append(
@@ -120,7 +117,7 @@ def _extract_graph_elements_from_text(raw_text, source_element):
                 subj=nodes[subj_id],
                 obj=nodes[obj_id],
                 type=rel_type,
-                properties={"source": "openrouter_llama_extracted"},
+                properties={"source": "llm_extracted"},
             )
         )
 
@@ -134,80 +131,298 @@ def _extract_graph_elements_from_text(raw_text, source_element):
     return graph_element
 
 
+def _icd_chapter(code_str):
+    """Extract the ICD chapter prefix (first 3 chars) for grouping."""
+    code = re.sub(r"[^A-Za-z0-9]", "", code_str.strip())
+    return code[:3] if len(code) >= 3 else code
+
+
 def _fallback_extract_graph_elements(raw_text, source_element):
+    """Structured fallback: build a medical knowledge graph from structured
+    clinical text.  Creates a distributed mesh of inter-entity relationships
+    rather than a patient-centric star or any single hub node.
+    """
     nodes = {}
     relationships = []
 
-    def _add_node(node_id, node_type):
+    def _add_node(node_id, node_type, description=""):
         key = node_id.strip()
         if key and key not in nodes:
-            nodes[key] = Node(
-                id=key,
-                type=node_type,
-                properties={"source": "structured_fallback"},
-            )
+            props = {"source": "structured_fallback"}
+            if description:
+                props["description"] = description
+            nodes[key] = Node(id=key, type=node_type, properties=props)
         return nodes.get(key)
 
-    patient_match = re.search(r"patient_id:\s*(\d+)", raw_text)
-    patient_id = f"patient_{patient_match.group(1)}" if patient_match else "patient_unknown"
-    patient_node = _add_node(patient_id, "Patient")
+    # =====================================================================
+    # 1) DICTIONARY DATA  (bottom / middle layer)
+    #    Create clustered sub-graphs using ICD code grouping.
+    # =====================================================================
 
-    for diagnosis in re.findall(r"\[\d+\]\s*([^;\.\n]+)", raw_text):
-        d = diagnosis.strip()
-        if not d:
-            continue
-        d_node = _add_node(d, "Diagnosis")
+    # --- Diagnosis dictionary entries ---
+    icd_diag_groups = {}  # chapter_prefix -> list of nodes
+    for match in re.finditer(
+        r"DIAGNOSIS\s+code=(\S+)\s+icd_version=(\S+)\s+name=(.+?)(?:\n|$)", raw_text
+    ):
+        code, ver, name = match.group(1), match.group(2), match.group(3).strip()
+        d_node = _add_node(name, "Diagnosis", f"ICD-{ver} code {code}: {name}")
+        chapter = _icd_chapter(code)
+        icd_diag_groups.setdefault(chapter, []).append(d_node)
+
+    # Link diagnoses within the same ICD chapter (chain rather than clique)
+    for chapter, group_nodes in icd_diag_groups.items():
+        for i in range(len(group_nodes) - 1):
+            relationships.append(
+                Relationship(
+                    subj=group_nodes[i],
+                    obj=group_nodes[i + 1],
+                    type="icd_related",
+                    properties={"source": "structured_fallback", "icd_chapter": chapter},
+                )
+            )
+
+    # --- Procedure dictionary entries ---
+    icd_proc_groups = {}
+    for match in re.finditer(
+        r"PROCEDURE\s+code=(\S+)\s+icd_version=(\S+)\s+name=(.+?)(?:\n|$)", raw_text
+    ):
+        code, ver, name = match.group(1), match.group(2), match.group(3).strip()
+        p_node = _add_node(name, "Procedure", f"ICD-{ver} procedure code {code}: {name}")
+        chapter = _icd_chapter(code)
+        icd_proc_groups.setdefault(chapter, []).append(p_node)
+
+    for chapter, group_nodes in icd_proc_groups.items():
+        for i in range(len(group_nodes) - 1):
+            relationships.append(
+                Relationship(
+                    subj=group_nodes[i],
+                    obj=group_nodes[i + 1],
+                    type="icd_related",
+                    properties={"source": "structured_fallback", "icd_chapter": chapter},
+                )
+            )
+
+    # --- Lab dictionary entries ---
+    lab_category_groups = {}
+    for match in re.finditer(
+        r"LAB_TEST\s+itemid=(\S+)\s+label=(.+?)\s+fluid=(\S+)\s+category=(.+?)(?:\n|$)",
+        raw_text,
+    ):
+        itemid, label, fluid, category = (
+            match.group(1),
+            match.group(2).strip(),
+            match.group(3).strip(),
+            match.group(4).strip(),
+        )
+        desc = f"Lab test (item {itemid}): {label}, fluid={fluid}, category={category}"
+        l_node = _add_node(label, "LabTest", desc)
+        group_key = f"{fluid}_{category}"
+        lab_category_groups.setdefault(group_key, []).append(l_node)
+
+    # Chain labs within the same category
+    for group_key, group_nodes in lab_category_groups.items():
+        for i in range(len(group_nodes) - 1):
+            relationships.append(
+                Relationship(
+                    subj=group_nodes[i],
+                    obj=group_nodes[i + 1],
+                    type="same_category",
+                    properties={"source": "structured_fallback", "category": group_key},
+                )
+            )
+
+    # Cross-link: connect each ICD diag chapter head to related procedure chapter head
+    diag_heads = {ch: ns[0] for ch, ns in icd_diag_groups.items() if ns}
+    proc_heads = {ch: ns[0] for ch, ns in icd_proc_groups.items() if ns}
+    for chapter in set(diag_heads) & set(proc_heads):
         relationships.append(
             Relationship(
-                subj=patient_node,
-                obj=d_node,
-                type="HAS_DIAGNOSIS",
+                subj=proc_heads[chapter],
+                obj=diag_heads[chapter],
+                type="procedure_for_category",
                 properties={"source": "structured_fallback"},
             )
         )
 
-    proc_line = re.search(r"Procedures:\s*(.*)", raw_text)
-    if proc_line:
-        for proc in [p.strip() for p in proc_line.group(1).split(";") if p.strip()]:
-            p_node = _add_node(proc, "Procedure")
+    # =====================================================================
+    # 2) GUIDELINE DATA  (middle layer)
+    # =====================================================================
+
+    guideline_conditions = []
+    for match in re.finditer(r"Condition\s+\d+:\s+Consider diagnosis\s+'([^']+)'", raw_text):
+        name = match.group(1).strip()
+        g_node = _add_node(name, "Diagnosis", f"Guideline-referenced diagnosis: {name}")
+        guideline_conditions.append(g_node)
+
+    guideline_interventions = []
+    for match in re.finditer(r"Intervention\s+\d+:\s+Procedure option\s+'([^']+)'", raw_text):
+        name = match.group(1).strip()
+        g_node = _add_node(name, "Procedure", f"Guideline-referenced procedure: {name}")
+        guideline_interventions.append(g_node)
+
+    # Round-robin link interventions to conditions (1:1 instead of many-to-many)
+    if guideline_conditions and guideline_interventions:
+        n_cond = len(guideline_conditions)
+        for i, p_node in enumerate(guideline_interventions):
+            d_node = guideline_conditions[i % n_cond]
             relationships.append(
                 Relationship(
-                    subj=patient_node,
-                    obj=p_node,
-                    type="UNDERWENT",
+                    subj=p_node,
+                    obj=d_node,
+                    type="indicated_for",
                     properties={"source": "structured_fallback"},
                 )
             )
 
-    meds_line = re.search(r"Medications:\s*(.*)", raw_text)
-    if meds_line:
-        for med in [m.strip() for m in meds_line.group(1).split(";") if m.strip()]:
-            med_name = med.split(" via ")[0].strip()
-            m_node = _add_node(med_name, "Medication")
-            relationships.append(
-                Relationship(
-                    subj=patient_node,
-                    obj=m_node,
-                    type="RECEIVED_MEDICATION",
-                    properties={"source": "structured_fallback"},
-                )
+    # Chain guideline conditions (sequential, not clique)
+    for i in range(len(guideline_conditions) - 1):
+        relationships.append(
+            Relationship(
+                subj=guideline_conditions[i],
+                obj=guideline_conditions[i + 1],
+                type="associated_with",
+                properties={"source": "structured_fallback"},
             )
+        )
 
-    labs_line = re.search(r"Recent labs:\s*(.*)", raw_text)
-    if labs_line:
-        for lab in [l.strip() for l in labs_line.group(1).split(";") if l.strip()]:
-            lab_name = lab.split(":")[0].strip()
-            if not lab_name:
+    # =====================================================================
+    # 3) PATIENT CLINICAL DATA  (top layer)
+    #    Distribute relationships evenly — NO single diagnosis hub.
+    # =====================================================================
+
+    patient_match = re.search(r"patient_id:\s*(\d+)", raw_text)
+    patient_id = f"patient_{patient_match.group(1)}" if patient_match else None
+    patient_node = _add_node(patient_id, "Patient") if patient_id else None
+
+    # Split by admission blocks
+    admission_blocks = re.split(r"(?=Admission summary:)", raw_text)
+
+    for block in admission_blocks:
+        # --- Diagnoses ---
+        block_diagnoses = []
+        for diag in re.findall(r"\[\d+\]\s*([^;\.\n]+)", block):
+            d = diag.strip()
+            if not d:
                 continue
-            l_node = _add_node(lab_name, "LabTest")
+            d_node = _add_node(d, "Diagnosis", f"Clinical diagnosis: {d}")
+            block_diagnoses.append(d_node)
+
+        # --- Procedures ---
+        block_procedures = []
+        proc_line = re.search(r"Procedures:\s*(.*)", block)
+        if proc_line:
+            for proc in [p.strip() for p in proc_line.group(1).split(";") if p.strip()]:
+                proc_name = re.sub(r"\s+on\s+\d{4}-\d{2}-\d{2}.*", "", proc).strip()
+                if not proc_name:
+                    continue
+                p_node = _add_node(proc_name, "Procedure", f"Medical procedure: {proc_name}")
+                block_procedures.append(p_node)
+
+        # --- Medications ---
+        block_medications = []
+        meds_line = re.search(r"Medications:\s*(.*)", block)
+        if meds_line:
+            for med in [m.strip() for m in meds_line.group(1).split(";") if m.strip()]:
+                med_name = med.split(" via ")[0].strip()
+                route = med.split(" via ")[1].strip() if " via " in med else ""
+                if not med_name:
+                    continue
+                desc = f"Medication: {med_name}"
+                if route:
+                    desc += f" administered via {route}"
+                m_node = _add_node(med_name, "Medication", desc)
+                block_medications.append(m_node)
+
+        # --- Lab Tests ---
+        block_labs = []
+        labs_line = re.search(r"Recent labs:\s*(.*)", block)
+        if labs_line:
+            for lab in [l.strip() for l in labs_line.group(1).split(";") if l.strip()]:
+                lab_name = lab.split(":")[0].strip()
+                lab_value = lab.split(":")[1].strip() if ":" in lab else ""
+                if not lab_name:
+                    continue
+                desc = f"Laboratory test: {lab_name}"
+                if lab_value:
+                    desc += f", result: {lab_value}"
+                l_node = _add_node(lab_name, "LabTest", desc)
+                block_labs.append(l_node)
+
+        # === INTER-ENTITY RELATIONSHIPS (distributed, no mega-hub) ===
+
+        n_diag = len(block_diagnoses)
+        if n_diag == 0:
+            continue
+
+        # Procedure --performed_for--> Diagnosis (round-robin, 1:1)
+        for i, p_node in enumerate(block_procedures):
+            d_node = block_diagnoses[i % n_diag]
             relationships.append(
                 Relationship(
-                    subj=patient_node,
-                    obj=l_node,
-                    type="HAS_LAB",
+                    subj=p_node, obj=d_node, type="performed_for",
                     properties={"source": "structured_fallback"},
                 )
             )
+
+        # Medication --treats--> Diagnosis (round-robin, 1:1)
+        for i, m_node in enumerate(block_medications):
+            d_node = block_diagnoses[i % n_diag]
+            relationships.append(
+                Relationship(
+                    subj=m_node, obj=d_node, type="treats",
+                    properties={"source": "structured_fallback"},
+                )
+            )
+
+        # LabTest --monitors--> Diagnosis (round-robin, 1:1)
+        for i, l_node in enumerate(block_labs):
+            d_node = block_diagnoses[i % n_diag]
+            relationships.append(
+                Relationship(
+                    subj=l_node, obj=d_node, type="monitors",
+                    properties={"source": "structured_fallback"},
+                )
+            )
+
+        # Diagnosis chain (sequential, not clique — avoids O(n²) edges)
+        for i in range(n_diag - 1):
+            relationships.append(
+                Relationship(
+                    subj=block_diagnoses[i],
+                    obj=block_diagnoses[i + 1],
+                    type="associated_with",
+                    properties={"source": "structured_fallback"},
+                )
+            )
+
+        # Medication --administered_via--> route grouping
+        # (connect medications sharing the same route)
+        route_groups = {}
+        for m_node in block_medications:
+            desc = (m_node.properties or {}).get("description", "")
+            route_match = re.search(r"via (\S+)", desc)
+            if route_match:
+                route = route_match.group(1)
+                route_groups.setdefault(route, []).append(m_node)
+        for route, meds in route_groups.items():
+            for i in range(len(meds) - 1):
+                relationships.append(
+                    Relationship(
+                        subj=meds[i], obj=meds[i + 1], type="same_route",
+                        properties={"source": "structured_fallback", "route": route},
+                    )
+                )
+
+    # Patient gets a single link to just the FIRST diagnosis (minimal presence)
+    if patient_node and block_diagnoses:
+        relationships.append(
+            Relationship(
+                subj=patient_node,
+                obj=block_diagnoses[0],
+                type="diagnosed_with",
+                properties={"source": "structured_fallback"},
+            )
+        )
 
     return GraphElement(
         nodes=list(nodes.values()),
@@ -242,4 +457,3 @@ def creat_metagraph(args, content, gid, n4j):
         merge_similar_nodes(n4j, gid)
     add_sum(n4j, whole_chunk, gid)
     return n4j
-

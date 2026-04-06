@@ -54,13 +54,41 @@ def select_top_gids(n4j, sumq, top_k=3):
         """
     )
 
-    if not rows:
-        return []
-
     query_summary = _summary_to_text(sumq[0] if isinstance(sumq, list) and sumq else sumq)
-    scored = []
     query_embedding = get_embedding(query_summary)
 
+    if not rows:
+        # No Summary nodes — fall back to sampling entity nodes with embeddings
+        # and ranking by cosine similarity to the question.
+        entity_rows = n4j.query(
+            """
+            MATCH (n)
+            WHERE n.embedding IS NOT NULL AND n.gid IS NOT NULL AND NOT n:Summary
+            RETURN n.gid AS gid, n.embedding AS embedding
+            LIMIT 500
+            """
+        )
+        if not entity_rows:
+            return []
+        scored = []
+        for row in entity_rows:
+            emb = row.get("embedding")
+            gid = row.get("gid")
+            if emb and gid:
+                scored.append((_cosine(emb, query_embedding), gid))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        # Deduplicate GIDs while preserving ranking order
+        seen = set()
+        top = []
+        for _, gid in scored:
+            if gid not in seen:
+                seen.add(gid)
+                top.append(gid)
+            if len(top) >= max(1, top_k):
+                break
+        return top
+
+    scored = []
     for row in rows:
         summary_text = _summary_to_text(row.get("content"))
         if not summary_text:
