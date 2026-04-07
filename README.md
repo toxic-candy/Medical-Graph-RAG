@@ -77,8 +77,8 @@ Generate patient report text files used as top-layer documents:
 ```bash
 python preprocess_mimic_demo.py \
   --mimic-root ./mimic-iv-clinical-database-demo-2.2 \
-  --output-dir ./dataset/mimic_demo_10 \
-  --n-patients 10
+  --output-dir ./dataset/mimic_demo_100 \
+  --n-patients 100
 ```
 
 ### Step 4: Prepare all three layer datasets
@@ -91,7 +91,7 @@ This builds:
 ```bash
 python prepare_three_layer_data.py \
   --repo-root . \
-  --top-path ./dataset/mimic_demo_10 \
+  --top-path ./dataset/mimic_demo_100 \
   --out-root ./dataset/three_layer
 ```
 
