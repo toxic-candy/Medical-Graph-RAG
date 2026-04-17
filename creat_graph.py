@@ -6,6 +6,7 @@ from camel.loaders import UnstructuredIO
 from camel.storages.graph_storages.graph_element import GraphElement, Node, Relationship
 
 from utils import *
+from cxr_integration import extract_cxr_mentions_from_text
 
 
 KG_SYSTEM_PROMPT = (
@@ -35,7 +36,8 @@ KG_SYSTEM_PROMPT = (
 
 def _extract_graph_elements_from_text(raw_text, source_element):
     if os.getenv("USE_LLM_EXTRACTION", "0") != "1":
-        return _fallback_extract_graph_elements(raw_text, source_element)
+        base_ge = _fallback_extract_graph_elements(raw_text, source_element)
+        return _augment_with_cxr(raw_text, base_ge)
 
     api_key = os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY")
     client = OpenAI(
@@ -66,7 +68,8 @@ def _extract_graph_elements_from_text(raw_text, source_element):
         )
         content = response.choices[0].message.content or ""
     except Exception:
-        return _fallback_extract_graph_elements(raw_text, source_element)
+        base_ge = _fallback_extract_graph_elements(raw_text, source_element)
+        return _augment_with_cxr(raw_text, base_ge)
 
     # Parse nodes — with optional description field
     node_pattern = r"Node\(id='(.*?)', type='(.*?)'(?:, description='(.*?)')?\)"
@@ -127,14 +130,78 @@ def _extract_graph_elements_from_text(raw_text, source_element):
         source=source_element,
     )
     if not graph_element.nodes:
-        return _fallback_extract_graph_elements(raw_text, source_element)
-    return graph_element
+        graph_element = _fallback_extract_graph_elements(raw_text, source_element)
+    return _augment_with_cxr(raw_text, graph_element)
 
 
 def _icd_chapter(code_str):
     """Extract the ICD chapter prefix (first 3 chars) for grouping."""
     code = re.sub(r"[^A-Za-z0-9]", "", code_str.strip())
     return code[:3] if len(code) >= 3 else code
+
+
+def _augment_with_cxr(raw_text, graph_element):
+    patient_subject_id, cxr_mentions = extract_cxr_mentions_from_text(raw_text)
+    if not patient_subject_id or not cxr_mentions:
+        return graph_element
+
+    node_index = {str(node.id): node for node in graph_element.nodes}
+    rel_index = {
+        (str(rel.subj.id), str(rel.obj.id), str(rel.type).lower())
+        for rel in graph_element.relationships
+    }
+
+    patient_node_id = f"patient_{patient_subject_id}"
+    patient_node = node_index.get(patient_node_id)
+    if patient_node is None:
+        patient_node = Node(
+            id=patient_node_id,
+            type="Patient",
+            properties={"source": "cxr_integration"},
+        )
+        node_index[patient_node_id] = patient_node
+
+    for mention in cxr_mentions:
+        study_id = mention.get("study_id", "")
+        if not study_id:
+            continue
+        impression = (mention.get("impression") or "").strip()
+        cxr_node_id = f"cxr_{patient_subject_id}_{study_id}"
+
+        cxr_node = node_index.get(cxr_node_id)
+        description = f"Chest X-ray report study_id={study_id}"
+        if impression:
+            description = f"{description}; impression: {impression}"
+
+        if cxr_node is None:
+            props = {"source": "cxr_integration", "study_id": study_id}
+            if description:
+                props["description"] = description
+            cxr_node = Node(id=cxr_node_id, type="CXR_Report", properties=props)
+            node_index[cxr_node_id] = cxr_node
+        else:
+            if cxr_node.properties is None:
+                cxr_node.properties = {}
+            cxr_node.properties.setdefault("study_id", study_id)
+            cxr_node.properties.setdefault("source", "cxr_integration")
+            if description and not cxr_node.properties.get("description"):
+                cxr_node.properties["description"] = description
+
+        rel_key = (patient_node_id, cxr_node_id, "has_cxr")
+        if rel_key in rel_index:
+            continue
+        graph_element.relationships.append(
+            Relationship(
+                subj=patient_node,
+                obj=cxr_node,
+                type="has_cxr",
+                properties={"source": "cxr_integration", "study_id": study_id},
+            )
+        )
+        rel_index.add(rel_key)
+
+    graph_element.nodes = list(node_index.values())
+    return graph_element
 
 
 def _fallback_extract_graph_elements(raw_text, source_element):
@@ -453,6 +520,18 @@ def creat_metagraph(args, content, gid, n4j):
         graph_elements = add_gid(graph_elements, gid)
 
         n4j.add_graph_elements(graph_elements=[graph_elements])
+
+    if args.grained_chunk == True:
+        # Ensure patient-level CXR links are preserved even if fine-grained
+        # chunking splits patient_id and CXR lines across different chunks.
+        whole_element = uio.create_element_from_text(text=whole_chunk)
+        cxr_only = GraphElement(nodes=[], relationships=[], source=whole_element)
+        cxr_only = _augment_with_cxr(whole_chunk, cxr_only)
+        if cxr_only.nodes:
+            cxr_only = add_ge_emb(cxr_only)
+            cxr_only = add_gid(cxr_only, gid)
+            n4j.add_graph_elements(graph_elements=[cxr_only])
+
     if args.ingraphmerge:
         merge_similar_nodes(n4j, gid)
     add_sum(n4j, whole_chunk, gid)

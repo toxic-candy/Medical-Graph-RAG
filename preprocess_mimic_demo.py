@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from cxr_integration import load_subject_to_cxr_reports, serialize_cxr_reports_for_note
+
 
 def _safe_str(val) -> str:
     if pd.isna(val):
@@ -16,7 +18,35 @@ def _load_table(path: Path, required_name: str) -> pd.DataFrame:
     return pd.read_csv(path)
 
 
-def build_reports(mimic_root: Path, output_dir: Path, n_patients: int) -> None:
+def _select_subjects(admissions: pd.DataFrame, mimic_root: Path, n_patients: int):
+    admissions_subjects = admissions["subject_id"].dropna().astype(int).drop_duplicates().tolist()
+    admissions_subject_set = set(admissions_subjects)
+
+    demo_subject_path = mimic_root / "demo_subject_id.csv"
+    if demo_subject_path.exists():
+        demo_subjects = pd.read_csv(demo_subject_path)
+        if "subject_id" in demo_subjects.columns:
+            selected = []
+            for raw in demo_subjects["subject_id"].dropna().tolist():
+                try:
+                    sid = int(raw)
+                except Exception:
+                    continue
+                if sid in admissions_subject_set:
+                    selected.append(sid)
+            if selected:
+                return selected[:n_patients], "demo_subject_id.csv"
+
+    return admissions_subjects[:n_patients], "admissions.csv"
+
+
+def build_reports(
+    mimic_root: Path,
+    output_dir: Path,
+    n_patients: int,
+    include_cxr: bool = True,
+    max_cxr_reports_per_patient: int = 3,
+) -> None:
     hosp_dir = mimic_root / "hosp"
 
     patients = _load_table(hosp_dir / "patients.csv", "patients.csv")
@@ -48,16 +78,34 @@ def build_reports(mimic_root: Path, output_dir: Path, n_patients: int) -> None:
     labs = labs.merge(d_lab[["itemid", "label", "category"]], on="itemid", how="left")
 
     admissions = admissions.sort_values(["subject_id", "admittime"], ascending=[True, True])
-    selected_subjects = admissions["subject_id"].dropna().drop_duplicates().head(n_patients).tolist()
+    selected_subjects, subject_source = _select_subjects(admissions, mimic_root, n_patients)
+    print(f"Selected {len(selected_subjects)} subjects from {subject_source}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    subject_to_cxr_reports = {}
+    cxr_stats = {
+        "requested_patients": 0,
+        "patients_with_record_entry": 0,
+        "patients_with_loaded_reports": 0,
+        "reports_loaded": 0,
+        "missing_report_files": 0,
+        "reports_without_impression": 0,
+    }
+
+    if include_cxr:
+        subject_to_cxr_reports, cxr_stats = load_subject_to_cxr_reports(
+            cxr_record_list_path=mimic_root / "cxr-record-list.csv",
+            cxr_files_root=mimic_root / "cxr" / "files",
+            subject_ids=selected_subjects,
+            max_reports_per_patient=max(0, max_cxr_reports_per_patient),
+        )
 
     for i, subject_id in enumerate(selected_subjects):
         p_row = patients[patients["subject_id"] == subject_id].head(1)
         p = p_row.iloc[0] if not p_row.empty else None
 
         sub_adm = admissions[admissions["subject_id"] == subject_id].copy()
-        hadm_ids = sub_adm["hadm_id"].dropna().astype(int).tolist()
 
         lines = []
         lines.append(f"patient_id: {subject_id}")
@@ -147,6 +195,14 @@ def build_reports(mimic_root: Path, output_dir: Path, n_patients: int) -> None:
                 if micro_parts:
                     lines.append("Microbiology: " + "; ".join(micro_parts) + ".")
 
+        if include_cxr:
+            lines.append("radiology findings:")
+            cxr_lines = serialize_cxr_reports_for_note(subject_to_cxr_reports.get(str(subject_id), []))
+            if cxr_lines:
+                lines.extend(cxr_lines)
+            else:
+                lines.append("No CXR reports available for this patient.")
+
         lines.append("clinical impression:")
         lines.append(
             "This synthetic note was programmatically assembled from MIMIC-IV demo structured fields "
@@ -157,6 +213,15 @@ def build_reports(mimic_root: Path, output_dir: Path, n_patients: int) -> None:
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     print(f"Wrote {len(selected_subjects)} reports to: {output_dir}")
+
+    if include_cxr:
+        print("CXR integration stats:")
+        print(f"  patients_requested={cxr_stats['requested_patients']}")
+        print(f"  patients_with_record_entry={cxr_stats['patients_with_record_entry']}")
+        print(f"  patients_with_loaded_reports={cxr_stats['patients_with_loaded_reports']}")
+        print(f"  reports_loaded={cxr_stats['reports_loaded']}")
+        print(f"  missing_report_files={cxr_stats['missing_report_files']}")
+        print(f"  reports_without_impression={cxr_stats['reports_without_impression']}")
 
 
 def main() -> None:
@@ -181,12 +246,32 @@ def main() -> None:
         default=10,
         help="Number of unique patients to include.",
     )
+    parser.add_argument(
+        "--include-cxr",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Whether to inject MIMIC-CXR report impressions into each patient note.",
+    )
+    parser.add_argument(
+        "--max-cxr-reports-per-patient",
+        type=int,
+        default=3,
+        help="Maximum number of CXR studies to attach to each patient note.",
+    )
     args = parser.parse_args()
 
     if args.n_patients <= 0:
         raise ValueError("--n-patients must be > 0")
+    if args.max_cxr_reports_per_patient < 0:
+        raise ValueError("--max-cxr-reports-per-patient must be >= 0")
 
-    build_reports(args.mimic_root, args.output_dir, args.n_patients)
+    build_reports(
+        args.mimic_root,
+        args.output_dir,
+        args.n_patients,
+        include_cxr=args.include_cxr,
+        max_cxr_reports_per_patient=args.max_cxr_reports_per_patient,
+    )
 
 
 if __name__ == "__main__":
