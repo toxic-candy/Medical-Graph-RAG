@@ -209,6 +209,16 @@ What this stage does:
 3. Collects graph evidence triples.
 4. Generates a cited answer grounded in retrieved evidence.
 
+
+### Step 9: Audit layer (retrieval tracing)
+```bash
+export TRACE_RETRIEVAL=1
+export TRACE_OUTPUT_DIR=./retrieval_traces
+
+python post_graph_inference.py \
+  --neo4j-password test1234 \
+  --question "your question here"
+  ```
 ### Optional: Layer-specific visualization by gid
 
 Bottom layer only:
@@ -311,16 +321,3 @@ export NEO4J_PASSWORD= your NEO4J_PASSWORD
 1. put your prompt to ./prompt.txt
 
 2. python run.py -dataset mimic_ex -data_path ./dataset/mimic_ex(where you put the dataset) -inference
-
-## Acknowledgement
-We are building on [CAMEL](https://github.com/camel-ai/camel), an awesome framework for construcing multi-agent pipeline.
-
-## Cite
-~~~
-@article{wu2024medical,
-  title={Medical Graph RAG: Towards Safe Medical Large Language Model via Graph Retrieval-Augmented Generation},
-  author={Wu, Junde and Zhu, Jiayuan and Qi, Yunli},
-  journal={arXiv preprint arXiv:2408.04187},
-  year={2024}
-}
-~~~
