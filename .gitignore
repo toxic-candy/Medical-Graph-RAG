@@ -7,6 +7,12 @@ test*
 .dockerignore
 app.sh
 
+.env
+retrieval_traces/
+.github/
+1.*.md
+
+
 ### Python template
 # Byte-compiled / optimized / DLL files
 __pycache__
