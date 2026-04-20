@@ -152,6 +152,55 @@ def _compute_matched_nodes(n4j, sumq, trace=None):
     return rows
 
 
+def _build_selected_paths(seed_gids, expansion_steps):
+    """
+    Build explicit path records from seeds and expansion steps.
+    
+    Returns list of path records with: path_id, nodes, edges, path_score_total, 
+    score_components, selection_reason, tie_breaker.
+    """
+    paths = []
+    
+    # First, build implicit paths from each seed (seed to its neighbors)
+    for seed_gid in seed_gids:
+        # Direct seed path (seed alone)
+        paths.append({
+            "path_id": f"seed_{seed_gid[:8]}",
+            "nodes": [seed_gid],
+            "edges": [],
+            "path_score_total": 1.0,
+            "score_components": {
+                "seed_ranking": 1.0,
+                "expansion_depth": 0,
+                "path_length_penalty": 1.0
+            },
+            "selection_reason": "Selected as top-K seed via ranking",
+            "tie_breaker": None,
+            "path_type": "seed"
+        })
+        
+        # Seed + neighbor paths
+        seed_neighbors = [s for s in expansion_steps if s["from_node"] == seed_gid]
+        for step in seed_neighbors:
+            paths.append({
+                "path_id": f"{seed_gid[:8]}_to_{step['to_node'][:8]}",
+                "nodes": [seed_gid, step["to_node"]],
+                "edges": [step["path_id"]],
+                "path_score_total": step["step_score"],
+                "score_components": {
+                    "seed_ranking": 1.0,
+                    "expansion_score": step["step_score"],
+                    "expansion_depth": 1,
+                    "path_length_penalty": 1.0 / max(1, 2)  # 1 / path_length
+                },
+                "selection_reason": "Expanded from selected seed via REFERENCE",
+                "tie_breaker": f"step_rank_{step['step_rank']}" if step.get("step_rank") == 0 else None,
+                "path_type": "expanded"
+            })
+    
+    return paths
+
+
 def main():
     parser = argparse.ArgumentParser(description="Post-graph inference for three-layer Medical-Graph-RAG")
     parser.add_argument("--question", type=str, help="Question text")
@@ -225,14 +274,40 @@ def main():
     ordered_unique_gids = list(dict.fromkeys([g for g in expanded_gids if g]))
     if trace:
         trace.expanded_gids = ordered_unique_gids
+        
+        # Build and log selected paths (Phase 2)
+        selected_paths = _build_selected_paths(trace.selected_seed_gids, trace.expansion_steps)
+        for path_record in selected_paths:
+            trace.add_selected_path(path_record)
 
-    evidence = _collect_evidence(n4j, ordered_unique_gids, max_evidence=max(10, args.max_evidence))
+    # Collect evidence with gid tracking for provenance
+    evidence = []
+    evidence_with_gid = []
+    seen = set()
+    max_ev = max(10, args.max_evidence)
+    
+    for gid in ordered_unique_gids:
+        local_ctx = ret_context(n4j, gid)
+        ref_ctx = link_context(n4j, gid)
+        for line in local_ctx + ref_ctx:
+            clean = str(line).strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            evidence.append(clean)
+            evidence_with_gid.append((gid, clean))
+            if len(evidence) >= max_ev:
+                break
+        if len(evidence) >= max_ev:
+            break
+    
     if trace:
-        for i, ev in enumerate(evidence):
+        for i, (gid, ev_text) in enumerate(evidence_with_gid):
             trace.add_evidence_item({
-                "content": ev,
+                "content": ev_text,
                 "rank": i,
-                "evidence_type": "mixed"
+                "evidence_type": "mixed",
+                "node_id": gid
             })
     
     if not evidence:

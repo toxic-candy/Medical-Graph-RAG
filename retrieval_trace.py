@@ -34,6 +34,7 @@ class RetrievalTrace:
         self.config = {}
         self.matched_nodes = []
         self.expansion_steps = []
+        self.selected_paths = []  # final selected paths with scores
         self.evidence_items = []
         self.evidence_by_gid = {}
         self.answer_text = None
@@ -46,6 +47,7 @@ class RetrievalTrace:
             "expansion_step_count": 0,
             "evidence_item_count": 0,
             "unique_gids_used": 0,
+            "selected_path_count": 0,
         }
     
     def add_config(self, config_dict: Dict[str, Any]):
@@ -59,9 +61,15 @@ class RetrievalTrace:
         self.expansion_steps.append(step_record)
         self.statistics["expansion_step_count"] = len(self.expansion_steps)
     
+    def add_selected_path(self, path_record: Dict[str, Any]):
+        """Record a final selected path with scoring and selection rationale."""
+        self.selected_paths.append(path_record)
+        self.statistics["selected_path_count"] = len(self.selected_paths)
+    
     def add_evidence_item(self, evidence_record: Dict[str, Any]):
         self.evidence_items.append(evidence_record)
-        gid = evidence_record.get("gid")
+        # Track evidence source node (may be "node_id" or "gid")
+        gid = evidence_record.get("node_id") or evidence_record.get("gid")
         if gid:
             self.evidence_by_gid.setdefault(gid, []).append(evidence_record)
         self.statistics["evidence_item_count"] = len(self.evidence_items)
@@ -79,6 +87,7 @@ class RetrievalTrace:
             "expansion_steps": self.expansion_steps,
             "selected_seed_gids": self.selected_seed_gids,
             "expanded_gids": self.expanded_gids,
+            "selected_paths": self.selected_paths,  # NEW
             "evidence_items": self.evidence_items,
             "answer_text": self.answer_text,
             "answer_config": self.answer_config,
