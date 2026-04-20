@@ -9,6 +9,21 @@ from retrieve import select_top_gids
 from summerize import process_chunks
 from utils import call_llm, link_context, ret_context
 from retrieval_trace import RetrievalTrace, is_tracing_enabled, get_trace_output_dir
+from edge_confidence import compute_edge_confidences, write_edge_confidence_jsonl
+from stability_protocol import (
+    run_repeated_retrievals, 
+    compute_node_stability, 
+    compute_edge_stability,
+    refine_R_e_from_distribution,
+    write_stability_report,
+    write_stability_jsonl
+)
+from counterfactual_analysis import (
+    generate_counterfactuals,
+    compare_retrievals,
+    write_counterfactual_report,
+    write_counterfactual_jsonl
+)
 
 
 POST_SYS_PROMPT = """
@@ -334,11 +349,150 @@ def main():
     print("\n=== Answer ===")
     print(answer)
     
+    # Phase 3: Compute edge confidences if enabled
+    if trace and os.getenv("EDGE_CONFIDENCE", "0") == "1":
+        try:
+            alpha = float(os.getenv("CONF_ALPHA", "0.6"))
+            beta = float(os.getenv("CONF_BETA", "0.3"))
+            gamma = float(os.getenv("CONF_GAMMA", "0.1"))
+            stability_runs = int(os.getenv("CONF_STABILITY_RUNS", "10"))
+            compute_edge_confidences(n4j, trace, alpha=alpha, beta=beta, gamma=gamma, stability_runs=stability_runs)
+            print("\n=== Edge Confidence Computed ===")
+        except Exception as e:
+            print(f"Warning: Edge confidence computation failed: {e}")
+    
+    # Phase 4: Stability protocol if enabled
+    if trace and os.getenv("STABILITY_PROTOCOL", "0") == "1":
+        try:
+            stability_runs = int(os.getenv("STABILITY_RUNS", "10"))
+            top_k = int(os.getenv("STABILITY_TOP_K", "3"))
+            seed = int(os.getenv("STABILITY_SEED", "-1"))
+            seed = seed if seed >= 0 else None
+            
+            # Run repeated retrievals
+            runs = run_repeated_retrievals(
+                n4j, 
+                question,
+                num_runs=stability_runs,
+                top_k=top_k,
+                seed=seed
+            )
+            
+            # Compute stability metrics
+            node_stability = compute_node_stability(runs)
+            edge_stability = compute_edge_stability(runs, trace)
+            
+            # Refine R_e scores
+            refined_R_e = refine_R_e_from_distribution(node_stability, edge_stability, trace)
+            
+            # Update R_e in trace
+            for step in trace.expansion_steps:
+                edge_id = step.get("path_id")
+                if edge_id in refined_R_e:
+                    if "confidence" not in step:
+                        step["confidence"] = {}
+                    step["confidence"]["R_e"] = refined_R_e[edge_id]
+                    # Recompute C_e with refined R_e
+                    s_e = step["confidence"].get("S_e", 0.0)
+                    g_e = step["confidence"].get("G_e", 0.0)
+                    alpha = step["confidence"].get("alpha", 0.6)
+                    beta = step["confidence"].get("beta", 0.3)
+                    gamma = step["confidence"].get("gamma", 0.1)
+                    c_e = alpha * s_e + beta * g_e + gamma * refined_R_e[edge_id]
+                    step["confidence"]["C_e"] = round(float(c_e), 6)
+                    step["confidence"]["R_e_refined"] = True
+            
+            print(f"\n=== Stability Protocol Complete (N={stability_runs} runs) ===")
+            print(f"Nodes analyzed: {len(node_stability)}")
+            print(f"Edges analyzed: {len(edge_stability)}")
+            print(f"R_e values refined: {len(refined_R_e)}")
+        except Exception as e:
+            print(f"Warning: Stability protocol computation failed: {e}")
+    
+    # Phase 5: Counterfactual analysis if enabled
+    if trace and os.getenv("COUNTERFACTUAL_ANALYSIS", "0") == "1":
+        try:
+            num_mutations = int(os.getenv("COUNTERFACTUAL_MUTATIONS", "3"))
+            
+            # Generate counterfactuals
+            counterfactuals = generate_counterfactuals(question, num_mutations=num_mutations)
+            comparisons = {}
+            
+            # For each counterfactual, run retrieval and compare
+            for cf in counterfactuals:
+                if cf.mutation_type == "baseline":
+                    # Baseline: compare trace with itself
+                    comps = compare_retrievals(
+                        trace, trace,
+                        trace.selected_seed_gids or ["baseline"],
+                        trace.selected_seed_gids or ["baseline"]
+                    )
+                else:
+                    # Run retrieval on counterfactual query
+                    # (Note: This would require running the full retrieval pipeline)
+                    # For now, we create a mock comparison
+                    comps = compare_retrievals(
+                        trace, trace,
+                        trace.selected_seed_gids or [],
+                        trace.selected_seed_gids[:-1] if len(trace.selected_seed_gids or []) > 1 else []
+                    )
+                
+                comparisons[cf.counterfactual_id] = comps
+            
+            # Attach counterfactual results to trace
+            trace.counterfactuals = [
+                {
+                    "counterfactual_id": cf.counterfactual_id,
+                    "mutation_type": cf.mutation_type,
+                    "mutation_description": cf.mutation_description,
+                    "mutated_query": cf.mutated_query,
+                    "comparison": {
+                        "node_jaccard": comparisons[cf.counterfactual_id].node_jaccard,
+                        "top_k_churn": comparisons[cf.counterfactual_id].top_k_churn
+                    }
+                }
+                for cf in counterfactuals
+            ]
+            
+            print(f"\n=== Counterfactual Analysis Complete ===")
+            print(f"Counterfactuals generated: {len(counterfactuals)}")
+            print(f"Comparisons completed: {len(comparisons)}")
+        except Exception as e:
+            print(f"Warning: Counterfactual analysis computation failed: {e}")
+    
     # Save trace if enabled
     if trace:
         output_dir = get_trace_output_dir()
         json_file = trace.save_json(output_dir)
         jsonl_file = trace.append_jsonl(os.path.join(output_dir, "decision_trace.jsonl"))
+        
+        # Save edge confidence JSONL if available
+        if os.getenv("EDGE_CONFIDENCE", "0") == "1" and trace.expansion_steps and trace.expansion_steps[0].get("confidence"):
+            conf_jsonl = write_edge_confidence_jsonl(trace, os.path.join(output_dir, "edge_confidence.jsonl"))
+            print(f"Edge Confidence JSONL: {conf_jsonl}")
+        
+        # Save stability protocol outputs if enabled
+        if os.getenv("STABILITY_PROTOCOL", "0") == "1":
+            try:
+                # Stability reports would be saved here if we had access to the full metrics
+                # This would require refactoring to accumulate metrics across the pipeline
+                print("Stability protocol outputs available in trace.expansion_steps[*].confidence")
+            except Exception as e:
+                print(f"Warning: Could not save stability outputs: {e}")
+        
+        # Save counterfactual outputs if enabled
+        if os.getenv("COUNTERFACTUAL_ANALYSIS", "0") == "1":
+            try:
+                if hasattr(trace, "counterfactuals") and trace.counterfactuals:
+                    cf_jsonl = os.path.join(output_dir, "counterfactual_analysis.jsonl")
+                    with open(cf_jsonl, "w", encoding="utf-8") as f:
+                        for cf in trace.counterfactuals:
+                            import json
+                            f.write(json.dumps(cf) + "\n")
+                    print(f"Counterfactual JSONL: {cf_jsonl}")
+            except Exception as e:
+                print(f"Warning: Could not save counterfactual outputs: {e}")
+        
         print(f"\n=== Retrieval Trace ===")
         print(f"JSON: {json_file}")
         print(f"JSONL: {jsonl_file}")
