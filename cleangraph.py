@@ -16,6 +16,6 @@ class Neo4jConnection:
         tx.run("MATCH (n) DETACH DELETE n")
 
 # Example usage
-conn = Neo4jConnection("bolt://host.docker.internal:7687", "neo4j", "binglabi")
+conn = Neo4jConnection("bolt://host.docker.internal:7687", "neo4j", "test1234")
 conn.clean_graph()
 conn.close()
